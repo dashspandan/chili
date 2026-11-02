@@ -99,6 +99,99 @@ def get_volatile_pressures(planet):
 
 
 # -------------------------------------------------------------------------
+# Elemental partial pressures from the evolution model outputs
+#
+# mass_to_pressure_bar above returns the WEIGHT PER UNIT AREA of an
+# element, M_X g / A, which is NOT its partial pressure. MAGMAVOL's
+# targets are monatomic-equivalent partial pressures, sum_i nu(X,i)*p_i,
+# and for a well-mixed hydrostatic atmosphere
+#
+#     P_X = p_surf * (M_X / sum M) * (mmw / mu_X)
+#
+# The two differ by mu_bar/mu_X, which is a different factor for each
+# element, so elemental RATIOS built the weight-per-area way are mass
+# ratios rather than molar ratios. Across the CHILI models that made
+# hydrogen 18 to 42 times too low relative to carbon and oxygen.
+#
+# Two routes are available and both are computed:
+#
+#   species  sum the reported molecular partial pressures weighted by
+#            stoichiometry. Touches no masses, so a wrong massO_atm
+#            cannot reach it. Preferred whenever the reported species
+#            account for p_surf.
+#   mass     the formula above. Normalises by the sum of all three
+#            masses, so a wrong oxygen mass inflates hydrogen and
+#            carbon too: halving massO_atm leaves oxygen 16% low but
+#            hydrogen and carbon 68% high. Used only as a fallback.
+#
+# On the CHILI outputs the species route is available for every model at
+# every tau, and neongooey, gooey and moai have oxygen masses that are
+# wrong by four to six orders of magnitude, so the distinction matters.
+# -------------------------------------------------------------------------
+ATOMIC_MASS_KG_PER_MOL = {'H': 1.008e-3, 'C': 12.011e-3, 'O': 15.999e-3}
+
+REPORTED_SPECIES = {
+	'p_H2O(bar)' : {'H': 2, 'O': 1},
+	'p_CO2(bar)' : {'C': 1, 'O': 2},
+	'p_CO(bar)'  : {'C': 1, 'O': 1},
+	'p_H2(bar)'  : {'H': 2},
+	'p_CH4(bar)' : {'C': 1, 'H': 4},
+	'p_O2(bar)'  : {'O': 2},
+}
+
+# how far the reported molecular partials may fall short of p_surf
+# before the species route is treated as incomplete
+SPECIES_COVERAGE_TOL = 0.02
+
+
+def elemental_pressures_from_species(row):
+	"""
+	Monatomic-equivalent pressures (bar) from the reported molecular
+	partial pressures: P_X = sum_i nu(X, i) * p_i
+
+	Returns (dict, reported_total_bar, n_species_present). An absent or
+	NaN column counts as zero; the reported total lets a genuine zero be
+	told from an unreported species by comparison with p_surf.
+	"""
+	totals = {'H': 0., 'C': 0., 'O': 0.}
+	reported_total = 0.
+	n_present = 0
+
+	for col, stoich in REPORTED_SPECIES.items():
+		if col not in row.index:
+			continue
+		val = row[col]
+		if val is None or np.isnan(val):
+			continue
+		n_present += 1
+		reported_total += val
+		for el, nu in stoich.items():
+			totals[el] += nu * val
+
+	return totals, reported_total, n_present
+
+
+def partial_pressure_from_mass(mass_kg, mass_total_kg, p_surf_bar,
+	mmw_kg_mol, element):
+	"""
+	P_X = p_surf * (M_X / sum M) * (mmw / mu_X), in bar.
+
+	Uses only reported quantities, so unlike the g/A form it cannot
+	inherit an error from assumed planetary parameters. NaN if any
+	ingredient is missing.
+	"""
+	mu_X = ATOMIC_MASS_KG_PER_MOL[element]
+	if mass_kg is None or np.isnan(mass_kg):
+		return 0.
+	for v in (mass_total_kg, p_surf_bar, mmw_kg_mol):
+		if v is None or np.isnan(v):
+			return np.nan
+	if mass_total_kg <= 0. or mmw_kg_mol <= 0.:
+		return np.nan
+	return p_surf_bar * (mass_kg / mass_total_kg) * (mmw_kg_mol / mu_X)
+
+
+# -------------------------------------------------------------------------
 # IW buffer deviation (mirrors compute_Delta_IW in MAGMAVOLlite_construct.py
 # and check_chili.py)
 # -------------------------------------------------------------------------
@@ -120,26 +213,19 @@ def compute_Delta_IW(T_K, PO2_bar, Ptot_bar):
 
 def extract_seed_from_evolution(model_name, planet, tau_yr):
 	"""
-	Read a model's evolution CSV at the time closest to tau_yr, and
-	derive the seeded H/C/O (bar) and FO2_LOG_DEV inputs for
-	run_chili_single(), duplicating check_chili.py's extraction logic
-	so this script remains self-consistent.
+	Read the evolutionary model's own output at the time step closest to
+	tau_yr and return the seed for MAGMAVOL.
 
-	H/C/O (bar): converted from massH_atm(kg)/massC_atm(kg)/massO_atm(kg)
-	via mass_to_pressure_bar(), using the planet's own g/Rp. Missing
-	column, or NaN value -> 0. (matches check_chili.py's convention).
+	Elemental pressures are monatomic-equivalent partial pressures in
+	bar, matching what MAGMAVOL's targets are compared against. They come
+	from the reported molecular partial pressures where those account for
+	p_surf, and otherwise from the masses with p_surf and mmw. See the
+	note above the helpers for why the earlier weight-per-area values
+	were wrong and by how much.
 
-	FO2_LOG_DEV (the ΔIW value seeded into MAGMAVOL, rounded to 2
-	decimal places before use, since it feeds directly into a
-	filename — an unrounded float would make the filename unwieldy
-	or break downstream filename-based lookups):
-	  1. fO2_melt(bar) available (not NaN) -> Delta_IW from that, round(.,2)
-	  2. else p_O2(bar) available (not NaN) -> Delta_IW from that, round(.,2)
-	  3. else -> FO2_LOG_DEV_FALLBACK (4.0)
-
-	Returns a dict: {'T_surf', 'H', 'C', 'O', 'FO2_LOG_DEV', 't_used',
-	                  'fo2_source'} where fo2_source is one of
-	                  'melt', 'gas', or 'fallback' (for logging/traceability).
+	Returns T_surf, H, C and O in bar, the FO2_LOG_DEV target, the time
+	actually used, and which routes supplied the fugacity and the
+	pressures.
 	"""
 	csv_file = os.path.join(EVOL_DIR, model_name,
 		f'evolution-{model_name}-{planet}-data.csv')
@@ -163,12 +249,66 @@ def extract_seed_from_evolution(model_name, planet, tau_yr):
 	fO2_melt   = get_col('fO2_melt(bar)')
 	p_O2_gas   = get_col('p_O2(bar)')
 
+	mmw        = get_col('mmw(kg/mol)')
+
 	params = PLANET_PARAMS[planet]
 	g, Rp  = params['g'], params['Rp']
 
-	pH_bar = mass_to_pressure_bar(massH_atm, g, Rp) if not np.isnan(massH_atm) else 0.
-	pC_bar = mass_to_pressure_bar(massC_atm, g, Rp) if not np.isnan(massC_atm) else 0.
-	pO_bar = mass_to_pressure_bar(massO_atm, g, Rp) if not np.isnan(massO_atm) else 0.
+	# --- elemental partial pressures, by the two routes ---
+	p_species, p_reported_total, n_species = elemental_pressures_from_species(row)
+
+	masses = {'C': massC_atm, 'H': massH_atm, 'O': massO_atm}
+	mass_total = sum(v for v in masses.values()
+		if v is not None and not np.isnan(v))
+	p_mass = {el: partial_pressure_from_mass(masses[el], mass_total, p_surf,
+		mmw, el) for el in ('H', 'C', 'O')}
+
+	# fraction of p_surf the reported molecular partials fail to cover.
+	# Molecular partials must sum to p_surf by Dalton's law, so any
+	# shortfall means species are missing from the report. (The
+	# monatomic pressures do NOT sum to p_surf and cannot be used for
+	# this test: for an H2O/CO2 atmosphere they total about 3*p_surf.)
+	if p_surf is not None and not np.isnan(p_surf) and p_surf > 0.:
+		unaccounted = 1. - p_reported_total / p_surf
+	else:
+		unaccounted = np.nan
+
+	if (n_species > 0 and not np.isnan(unaccounted)
+			and abs(unaccounted) <= SPECIES_COVERAGE_TOL
+			and sum(p_species.values()) > 0.):
+		pH_bar, pC_bar, pO_bar = p_species['H'], p_species['C'], p_species['O']
+		p_source = 'species'
+	else:
+		pH_bar = p_mass['H'] if not np.isnan(p_mass['H']) else 0.
+		pC_bar = p_mass['C'] if not np.isnan(p_mass['C']) else 0.
+		pO_bar = p_mass['O'] if not np.isnan(p_mass['O']) else 0.
+		p_source = 'mass'
+
+	# The old weight-per-area values, kept only so the change is visible
+	# in the log rather than silent.
+	pH_old = mass_to_pressure_bar(massH_atm, g, Rp) if not np.isnan(massH_atm) else 0.
+	pC_old = mass_to_pressure_bar(massC_atm, g, Rp) if not np.isnan(massC_atm) else 0.
+	pO_old = mass_to_pressure_bar(massO_atm, g, Rp) if not np.isnan(massO_atm) else 0.
+
+	log.info(f"  elemental pressures from '{p_source}' route "
+		f"(reported species cover {1-unaccounted:.1%} of p_surf)")
+	for el, new_val, old_val in [('H', pH_bar, pH_old), ('C', pC_bar, pC_old),
+			('O', pO_bar, pO_old)]:
+		factor = new_val/old_val if old_val > 0. else float('nan')
+		log.info(f"    p{el} = {new_val:10.4f} bar "
+			f"(was {old_val:9.4f} by weight per area, factor {factor:6.2f})")
+
+	# Disagreement between the routes for oxygen flags an inconsistent
+	# massO_atm. massO_atm counts all atmospheric oxygen and the species
+	# sum only the reported volatiles, so the mass route should be the
+	# larger of the two.
+	if p_species['O'] > 0. and not np.isnan(p_mass['O']):
+		o_ratio = p_mass['O'] / p_species['O']
+		if o_ratio < 0.5 or o_ratio > 2.0:
+			log.info(f"    WARNING: oxygen from masses is {o_ratio:.3g} times "
+				f"that from the reported species; massO_atm for "
+				f"'{model_name}' is inconsistent with its own partial "
+				f"pressures")
 
 	# FO2_LOG_DEV cascade: melt -> gas -> fixed fallback
 	if not np.isnan(fO2_melt):
@@ -189,6 +329,8 @@ def extract_seed_from_evolution(model_name, planet, tau_yr):
 		'FO2_LOG_DEV' : fo2_log_dev,
 		't_used'      : t_used,
 		'fo2_source'  : fo2_source,
+		'p_source'    : p_source,
+		'unaccounted' : unaccounted,
 	}
 
 
@@ -249,11 +391,13 @@ TAU_CONFIG = {
 		'tau3': {'tau_yr': 1e3, 'hot_model': 'planatmo',  'cold_model': 'pacman'},
 		'tau4': {'tau_yr': 1e4, 'hot_model': 'proteus',   'cold_model': 'pacman'},
 		'tau5': {'tau_yr': 1e5, 'hot_model': 'neongooey', 'cold_model': 'pacman'},
+		'tau6': {'tau_yr': 1e6, 'hot_model': 'neongooey', 'cold_model': 'pacman'},
 	},
 	'venus': {
 		'tau3': {'tau_yr': 1e3, 'hot_model': 'planatmo',  'cold_model': 'pacman'},
 		'tau4': {'tau_yr': 1e4, 'hot_model': 'proteus',   'cold_model': 'pacman'},
 		'tau5': {'tau_yr': 1e5, 'hot_model': 'neongooey', 'cold_model': 'pacman'},
+		'tau6': {'tau_yr': 1e6, 'hot_model': 'neongooey', 'cold_model': 'pacman'},
 	},
 	'trappist1e': {
 		'tau3': {'tau_yr': 1e3, 'hot_model': 'planatmo',  'cold_model': 'pacman'},
@@ -268,7 +412,7 @@ TAU_CONFIG = {
 	'trappist1alpha': {
 		'tau3': {'tau_yr': 1e3, 'hot_model': 'gooey',     'cold_model': 'proteus'},
 		'tau4': {'tau_yr': 1e4, 'hot_model': 'gooey',     'cold_model': 'proteus'},
-		'tau6': {'tau_yr': 1e6, 'hot_model': 'gooey'},
+		'tau6': {'tau_yr': 1e6, 'hot_model': 'gooey',     'cold_model': 'gooey'},
 	},
 }
 
@@ -930,7 +1074,7 @@ if __name__ == '__main__':
 	data = run_chili_single(planet='earth', tau_key='tau4', hot_or_cold='cold', use_seeded_O=True)
 	data = run_chili_single(planet='earth', tau_key='tau5', hot_or_cold='hot', use_seeded_O=True)
 	data = run_chili_single(planet='earth', tau_key='tau5', hot_or_cold='cold', use_seeded_O=True)
-	
+
 	# --- venus ---
 	data = run_chili_single(planet='venus', tau_key='tau3', hot_or_cold='hot', use_seeded_O=True)
 	data = run_chili_single(planet='venus', tau_key='tau3', hot_or_cold='cold', use_seeded_O=True)
@@ -938,7 +1082,6 @@ if __name__ == '__main__':
 	data = run_chili_single(planet='venus', tau_key='tau4', hot_or_cold='cold', use_seeded_O=True)
 	data = run_chili_single(planet='venus', tau_key='tau5', hot_or_cold='hot', use_seeded_O=True)
 	data = run_chili_single(planet='venus', tau_key='tau5', hot_or_cold='cold', use_seeded_O=True)
-	
 
 	# -------------------------------------------------------------------------
 	# Step 1b: run seeded temperature grid and write a compo file.
@@ -967,7 +1110,6 @@ if __name__ == '__main__':
 	# run_chili_grid(planet='trappist1alpha', tau_key='tau4', hot_or_cold='hot', use_seeded_O=True)
 	# run_chili_grid(planet='trappist1alpha', tau_key='tau4', hot_or_cold='cold', use_seeded_O=True)
 	# run_chili_grid(planet='trappist1alpha', tau_key='tau6', hot_or_cold='hot', use_seeded_O=True)
-	# run_chili_grid(planet='trappist1alpha', tau_key='tau6', hot_or_cold='cold', use_seeded_O=True)
 
 	# --- earth ---
 	# run_chili_grid(planet='earth', tau_key='tau3', hot_or_cold='hot', use_seeded_O=True)
@@ -976,8 +1118,6 @@ if __name__ == '__main__':
 	# run_chili_grid(planet='earth', tau_key='tau4', hot_or_cold='cold', use_seeded_O=True)
 	# run_chili_grid(planet='earth', tau_key='tau5', hot_or_cold='hot', use_seeded_O=True)
 	# run_chili_grid(planet='earth', tau_key='tau5', hot_or_cold='cold', use_seeded_O=True)
-	# run_chili_grid(planet='earth', tau_key='tau6', hot_or_cold='hot', use_seeded_O=True)
-	# run_chili_grid(planet='earth', tau_key='tau6', hot_or_cold='cold', use_seeded_O=True)
 
 	# --- venus ---
 	# run_chili_grid(planet='venus', tau_key='tau3', hot_or_cold='hot', use_seeded_O=True)
@@ -986,8 +1126,6 @@ if __name__ == '__main__':
 	# run_chili_grid(planet='venus', tau_key='tau4', hot_or_cold='cold', use_seeded_O=True)
 	# run_chili_grid(planet='venus', tau_key='tau5', hot_or_cold='hot', use_seeded_O=True)
 	# run_chili_grid(planet='venus', tau_key='tau5', hot_or_cold='cold', use_seeded_O=True)
-	# run_chili_grid(planet='venus', tau_key='tau6', hot_or_cold='hot', use_seeded_O=True)
-	# run_chili_grid(planet='venus', tau_key='tau6', hot_or_cold='cold', use_seeded_O=True)
 
 	# -------------------------------------------------------------------------
 	# Step 2: run fixed-input temperature grid (Table 2/4 H/C, planet-only).
